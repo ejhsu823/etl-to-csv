@@ -115,7 +115,7 @@ foreach ($etl in $etls) {
     foreach ($ln in (Read-AllLinesShared $csv)) {
       if ($ln -notmatch 'DbgIdRSDS') { continue }
       $m = $dbgRe.Match($ln); if (-not $m.Success) { continue }
-      $pdb = $m.Groups[3].Value
+      $pdb = [IO.Path]::GetFileName($m.Groups[3].Value)
       $sig = (($m.Groups[1].Value -replace '-','') + ('{0:X}' -f [int]$m.Groups[2].Value)).ToUpper()
       if (-not $pdbNeeded.ContainsKey($pdb)) { $pdbNeeded[$pdb] = $sig }
     }
