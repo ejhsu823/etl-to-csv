@@ -1,6 +1,6 @@
 ---
 name: etl-to-csv
-description: "Convert Windows ETW/WPR .etl trace files to readable CSV. Decodes manifest events (tracerpt) AND WPP driver-internal events (tracepdb+tracefmt, pulling driver PDBs from symbol servers), then merges both into a single no-Unknown CSV per trace. Outputs each stage to a separate directory for verification. Use when asked to decode/convert .etl or ETW/ETL traces to CSV/text, analyze WPR Buses/Input/USB/HID traces, or resolve 'Unknown' WPP events in a trace."
+description: "Convert Windows ETW/WPR .etl trace files to readable CSV, or to a plain-text WPP log. Decodes manifest events (tracerpt) AND WPP driver-internal events (tracepdb+tracefmt, pulling driver PDBs from symbol servers), then merges both into a single no-Unknown CSV per trace; or, with -WppOnly, skips the manifest decode and emits tracefmt's native plain-text WPP log directly (fast on large/verbose traces). Outputs each stage to a separate directory for verification. Use when asked to decode/convert .etl or ETW/ETL traces to CSV/text, produce a WPP log/trace, analyze WPR Buses/Input/USB/HID traces, or resolve 'Unknown' WPP events in a trace."
 ---
 
 # ETL → CSV (with WPP decode + merge)
@@ -31,7 +31,7 @@ row is enriched with the tracefmt-decoded message. Rows are never dropped.
 Always run via PowerShell. Pass a single `.etl` or a directory of them.
 
 ```powershell
-& "$env:USERPROFILE\.claude\skills\etl-to-csv\scripts\Convert-EtlToCsv.ps1" -Path <etl-or-dir> [-OutDir <dir>] [-SymbolServers <urls>] [-SkipWpp]
+& "$env:USERPROFILE\.claude\skills\etl-to-csv\scripts\Convert-EtlToCsv.ps1" -Path <etl-or-dir> [-OutDir <dir>] [-SymbolServers <urls>] [-SkipWpp | -WppOnly]
 ```
 
 Examples:
@@ -44,7 +44,24 @@ Examples:
 
 # manifest-only (no symbol download / WPP)
 & "$env:USERPROFILE\.claude\skills\etl-to-csv\scripts\Convert-EtlToCsv.ps1" -Path C:\traces\x.etl -SkipWpp
+
+# plain-text WPP log only, skipping the slow full manifest decode
+& "$env:USERPROFILE\.claude\skills\etl-to-csv\scripts\Convert-EtlToCsv.ps1" -Path C:\traces\x.etl -WppOnly
 ```
+
+### `-WppOnly` (use when you only want the WPP/driver messages, as plain text)
+On large, high-event-rate traces (e.g. verbose USB packet captures), the default
+mode's full `tracerpt` manifest decode dominates the runtime — it text-formats
+*every* event just to extract a handful of `DbgIdRSDS` (PDB identity) lines that
+always show up within the first few lines of output, right at the start of the
+trace's image-load rundown. `-WppOnly` runs `tracerpt` in the background, kills
+it a few seconds after those PDB identities stop appearing, and skips straight to
+symbols → `tracepdb` → `tracefmt` against the `.etl`. No `csv\` manifest decode,
+no `merged\` spine — just `wpp_log\<name>.wpp.log`, tracefmt's native plain-text
+WPP log (one decoded message per line, e.g.
+`[19]0004.2B5C::09/21/2026-11:04:14.065 [usb4hrd][2][0xPTR]message text`;
+non-WPP events show as `Unknown(...)` since there's no manifest decode/merge in
+this mode).
 
 ## Output layout (each stage in its own dir, under `-OutDir`)
 | Dir | Produced by | Contents |
@@ -54,6 +71,7 @@ Examples:
 | `tmf\` | tracepdb | WPP format (`.tmf`) files |
 | `wpp\` | tracefmt | WPP decode CSV (manifest = `Unknown`) |
 | `merged\` | this skill | **final** `<name>.merged.csv` — tracerpt columns + decoded WPP |
+| `wpp_log\` | tracefmt (`-WppOnly` only) | plain-text WPP log, `<name>.wpp.log` |
 
 **Merged format** = the original tracerpt columns in their original order, with **one new
 column `WPP message` inserted right after `Type`**:
@@ -75,6 +93,8 @@ WPP↔tracerpt rows are matched by `(PID, TID, millisecond-UTC)` in event order.
 
 ## Notes
 - PDB identities come from the trace's own `DbgIdRSDS` records (parsed out of the
-  tracerpt CSV); signature = `<GUID-no-dashes><AgeHex>`. No external lookup needed.
-- `symbols\` and `tmf\` are caches — re-running across many traces reuses them.
+  tracerpt CSV, or harvested early under `-WppOnly`); signature =
+  `<GUID-no-dashes><AgeHex>`. No external lookup needed.
+- `symbols\` and `tmf\` are caches — re-running across many traces reuses them,
+  including between default and `-WppOnly` runs.
 - `tracerpt -lr` conflicts with `-summary`/`-report`; the skill avoids that combo.

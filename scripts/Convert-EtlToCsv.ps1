@@ -2,10 +2,11 @@
 .SYNOPSIS
   Convert Windows ETW/WPR .etl trace(s) to readable CSV, decoding BOTH manifest
   events (tracerpt) and WPP driver-internal events (tracepdb+tracefmt), then merge
-  them into a single no-"Unknown" CSV per trace.
+  them into a single no-"Unknown" CSV per trace. Or, with -WppOnly, skip the
+  manifest decode/merge entirely and emit a plain-text WPP log instead.
 
 .DESCRIPTION
-  Pipeline per .etl:
+  Default pipeline per .etl:
     1. tracerpt  -> csv\<name>.csv        (manifest events; WPP shows as "Unknown")
     2. parse DbgIdRSDS records from the CSV -> download matching PDBs from the
        symbol server(s) into symbols\<pdb>\<sig>\<pdb>  (cached)
@@ -33,18 +34,35 @@
 .PARAMETER SkipWpp
   Only do the manifest (tracerpt) decode; skip symbols/WPP/merge.
 
+.PARAMETER WppOnly
+  Skip the full manifest tracerpt decode (the expensive part on large/verbose
+  traces - it text-formats every event just to extract a handful of
+  DbgIdRSDS/PDB-identity lines that always show up within the first few lines
+  of output, right at the start of the trace's image-load rundown). Instead
+  runs tracerpt in the background just long enough to harvest those PDB
+  identities, kills it early, then goes straight to symbols -> tracepdb ->
+  tracefmt against the .etl - producing wpp_log\<name>.wpp.log, tracefmt's
+  native plain-text WPP log (one decoded message per line; non-WPP events
+  show as "Unknown(...)" since there's no manifest decode/merge in this
+  mode). No csv\ manifest decode, no merged\ spine.
+
 .EXAMPLE
   .\Convert-EtlToCsv.ps1 -Path C:\traces\Buses-Input.etl
 .EXAMPLE
   .\Convert-EtlToCsv.ps1 -Path C:\traces -OutDir C:\out
+.EXAMPLE
+  # just the WPP driver messages as plain text, skipping the slow full manifest decode
+  .\Convert-EtlToCsv.ps1 -Path C:\traces\x.etl -WppOnly
 #>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory)][string]$Path,
   [string]$OutDir,
   [string[]]$SymbolServers = @('https://dispsym/sym','https://dvssymsrv/symbols'),
-  [switch]$SkipWpp
+  [switch]$SkipWpp,
+  [switch]$WppOnly
 )
+if ($SkipWpp -and $WppOnly) { throw "-SkipWpp and -WppOnly are mutually exclusive." }
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
@@ -79,7 +97,7 @@ if (-not $OutDir) {
   $OutDir = Join-Path $parent 'etl_decoded'
 }
 $dirs = @{}
-foreach ($d in 'csv','symbols','tmf','wpp','merged') {
+foreach ($d in 'csv','symbols','tmf','wpp','merged','wpp_log') {
   $dirs[$d] = Join-Path $OutDir $d
   New-Item -ItemType Directory -Force -Path $dirs[$d] | Out-Null
 }
@@ -95,6 +113,53 @@ function Read-AllLinesShared([string]$file) {
   $fs = [System.IO.File]::Open($file,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
   try { (New-Object System.IO.StreamReader($fs)).ReadToEnd() -split "`r?`n" } finally { $fs.Dispose() }
 }
+function Read-LinesShared([string]$file) {
+  # Streams lines one at a time (StreamReader.ReadLine) instead of ReadToEnd()+split,
+  # which for multi-GB tracerpt CSVs doubles/triples memory use and can OOM.
+  $fs = [System.IO.File]::Open($file,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
+  $sr = New-Object System.IO.StreamReader($fs)
+  try {
+    while ($null -ne ($ln = $sr.ReadLine())) { $ln }
+  } finally { $sr.Dispose(); $fs.Dispose() }
+}
+
+# DbgIdRSDS records (one per loaded image, naming its PDB + signature) are
+# emitted once, right at the start of the trace's event stream, as part of the
+# image-load rundown. Under -WppOnly we run tracerpt in the background and kill
+# it as soon as the rundown looks done, instead of waiting for a full multi-GB
+# text-format pass whose output (beyond those first few lines) we don't need.
+function Get-PdbIdentitiesEarly {
+  # tracerpt holds its output CSV open with an exclusive lock for the whole run,
+  # so it can't be read while still writing. Instead: let it run for a short,
+  # escalating window, kill it, then read whatever it flushed. Retry with a
+  # longer window (and a fresh run, since the killed process's file may be
+  # incomplete/locked briefly) only if nothing was found yet.
+  param([string]$TracerptExe, [string]$EtlPath, [string]$CsvPath)
+  $found = @{}
+  foreach ($waitSec in 5,15,45) {
+    if (Test-Path $CsvPath) { Remove-Item $CsvPath -Force -ErrorAction SilentlyContinue }
+    $proc = Start-Process -FilePath $TracerptExe -ArgumentList @($EtlPath,'-o',$CsvPath,'-of','CSV','-y') `
+      -WindowStyle Hidden -PassThru
+    Start-Sleep -Seconds $waitSec
+    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    $proc.WaitForExit(5000) | Out-Null
+    if (-not (Test-Path $CsvPath)) { continue }
+    for ($retry = 0; $retry -lt 5; $retry++) {
+      try {
+        foreach ($ln in (Read-LinesShared $CsvPath)) {
+          if ($ln -notmatch 'DbgIdRSDS') { continue }
+          $m = $dbgRe.Match($ln); if (-not $m.Success) { continue }
+          $pdb = [IO.Path]::GetFileName($m.Groups[3].Value)
+          $sig = (($m.Groups[1].Value -replace '-','') + ('{0:X}' -f [int]$m.Groups[2].Value)).ToUpper()
+          if (-not $found.ContainsKey($pdb)) { $found[$pdb] = $sig }
+        }
+        break
+      } catch { Start-Sleep -Milliseconds 500 }
+    }
+    if ($found.Count -gt 0) { break }
+  }
+  return $found
+}
 function To-HexId([string]$v) {
   if ([string]::IsNullOrWhiteSpace($v)) { return '' }
   try { return ([Convert]::ToInt64(($v -replace '^0x',''),16)).ToString('X') } catch { return $v.Trim() }
@@ -108,7 +173,16 @@ function CsvQuote([string]$v) {
 $pdbNeeded = @{}   # pdbName -> sig
 foreach ($etl in $etls) {
   $name = [IO.Path]::GetFileNameWithoutExtension($etl.Name)
-  $csv  = Join-Path $dirs['csv'] "$name.csv"
+  if ($WppOnly) {
+    $csv = Join-Path $dirs['wpp_log'] "$name.harvest.csv"
+    Write-Host "[tracerpt-early] $($etl.Name) (harvesting PDB identities only)" -ForegroundColor Yellow
+    $found = Get-PdbIdentitiesEarly -TracerptExe $tracerpt -EtlPath $etl.FullName -CsvPath $csv
+    foreach ($k in $found.Keys) { if (-not $pdbNeeded.ContainsKey($k)) { $pdbNeeded[$k] = $found[$k] } }
+    Write-Host "          found $($found.Count) PDB identity(ies), stopped early"
+    Remove-Item $csv -Force -ErrorAction SilentlyContinue
+    continue
+  }
+  $csv = Join-Path $dirs['csv'] "$name.csv"
   Write-Host "[tracerpt] $($etl.Name)" -ForegroundColor Yellow
   & $tracerpt $etl.FullName -o $csv -of CSV -y *> $null
   if ($doWpp -and (Test-Path $csv)) {
@@ -147,6 +221,26 @@ if ($doWpp -and $pdbNeeded.Count) {
   # ---- phase 3: tracepdb -> TMF (whole symbol store, idempotent) ------------
   Write-Host "[tracepdb] building TMF files" -ForegroundColor Yellow
   & $tracepdb -f (Join-Path $dirs['symbols'] '*.pdb') -s -p $dirs['tmf'] *> $null
+} elseif ($WppOnly) {
+  Write-Host "[symbols] no PDB identities found in trace; WPP messages will be undecoded" -ForegroundColor DarkYellow
+}
+
+# ---- phase 4 (WppOnly): tracefmt -> plain-text WPP log, no merge -------------
+# There is no full manifest CSV to use as a spine (tracerpt was killed early), so
+# just decode WPP straight from the .etl into tracefmt's native text format.
+if ($WppOnly) {
+  $report = @()
+  foreach ($etl in $etls) {
+    $name = [IO.Path]::GetFileNameWithoutExtension($etl.Name)
+    $logOut = Join-Path $dirs['wpp_log'] "$name.wpp.log"
+    Write-Host "[tracefmt] $($etl.Name)" -ForegroundColor Yellow
+    & $tracefmt $etl.FullName -p $dirs['tmf'] -o $logOut -utc *> $null
+    $report += [pscustomobject]@{ Trace=$name; PdbsFound=$pdbNeeded.Count; WppLog=$logOut }
+  }
+  Write-Host "`n=== Summary (WppOnly) ===" -ForegroundColor Cyan
+  $report | Format-Table -AutoSize | Out-String | Write-Host
+  Write-Host "WPP text log(s):  $($dirs['wpp_log'])"
+  return
 }
 
 # ---- phase 4+5: tracefmt + merge ---------------------------------------------
