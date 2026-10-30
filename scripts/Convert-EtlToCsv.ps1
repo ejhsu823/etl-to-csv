@@ -138,7 +138,7 @@ function Get-PdbIdentitiesEarly {
   $found = @{}
   foreach ($waitSec in 5,15,45) {
     if (Test-Path $CsvPath) { Remove-Item $CsvPath -Force -ErrorAction SilentlyContinue }
-    $proc = Start-Process -FilePath $TracerptExe -ArgumentList @($EtlPath,'-o',$CsvPath,'-of','CSV','-y') `
+    $proc = Start-Process -FilePath $TracerptExe -ArgumentList @("`"$EtlPath`"",'-o',"`"$CsvPath`"",'-of','CSV','-y') `
       -WindowStyle Hidden -PassThru
     Start-Sleep -Seconds $waitSec
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
